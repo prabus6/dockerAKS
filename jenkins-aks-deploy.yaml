@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-redis-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: prabus6/my-redis-container:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 6379
+
+# service type loadbalancer       
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: redis
+    k8s-app: redis
+  name: redis
+spec:
+  ports:
+  - name: http
+    port: 6379
+    protocol: TCP
+    targetPort: 6379
+  type: LoadBalancer
+  selector:
+    app: redis
+
+    

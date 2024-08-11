@@ -25,5 +25,15 @@ pipeline {
                 }
             }
         }
+
+        stage('AKS Deploy'){
+            steps{
+                script{
+                    withKubeConfig([credentialsId: 'K8S', serverUrl: '']) {
+                    sh ('kubectl apply -f  jenkins-aks-deploy.yaml')
+
+                }
+            }
+        }
     }
 }
