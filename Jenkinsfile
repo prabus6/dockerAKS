@@ -1,6 +1,10 @@
 pipeline {
     agent any
 
+    environment {
+        KUBECONFIG = credentials('kubeconfig-file-id')
+    }
+
     stages {
         stage('Checkout') {
             steps {
@@ -29,7 +33,7 @@ pipeline {
         stage('AKS Deploy'){
             steps{
                 script{
-                    withKubeConfig([credentialsId: 'K8S', serverUrl: '']) {
+                    withCredentials([file(credentialsId: 'kubeconfig-file-id', variable: 'KUBECONFIG')]) {
                     sh ('kubectl apply -f  jenkins-aks-deploy.yaml')
 
                 }
