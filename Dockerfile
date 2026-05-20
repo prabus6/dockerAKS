@@ -5,4 +5,4 @@ FROM redis:latest
 EXPOSE 6379
 
 # Command to start Redis
-CMD ["redis-server"]
+CMD [ "redis-server", "/usr/local/etc/redis/redis.conf" ]
