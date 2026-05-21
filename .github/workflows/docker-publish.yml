@@ -9,32 +9,80 @@ name: Docker
 #  schedule:
 #    - cron: '27 12 * * *'
 on:
-  push:
-    branches: [ "master" ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
-  pull_request:
-    branches: [ "master" ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to deploy"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      confirm:
+        description: "Type 'yes' to confirm deployment"
+        required: true
+        default: "no"
 
 env:
-  # Use docker.io for Docker Hub if empty
-  REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ github.repository }}
-
+  TF_VERSION: "1.8.3"        # OpenTofu latest — update as needed
+  WORKING_DIR: "."
 
 jobs:
-  build:
-
+  # ──────────────────────────────────────────────
+  # RESOLVE: Map environment input → branch + Azure credentials
+  # ──────────────────────────────────────────────
+  resolve:
+    name: Resolve environment
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    outputs:
+      branch: ${{ steps.map.outputs.branch }}
+      environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Validate confirmation
+        if: github.event.inputs.confirm != 'yes'
+        run: |
+          echo "Deployment not confirmed. Type 'yes' in the confirm input."
+          exit 1
+
+      - name: Map environment to branch
+        id: map
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          if [ "$ENV" = "dev" ]; then
+            echo "branch=dev" >> $GITHUB_OUTPUT
+          elif [ "$ENV" = "prod" ]; then
+            echo "branch=master" >> $GITHUB_OUTPUT
+          else
+            echo "Unknown environment: $ENV"
+            exit 1
+          fi
+#on:
+#  push:
+#    branches: [ "master" ]
+    # Publish semver tags as releases.
+#    tags: [ 'v*.*.*' ]
+#  pull_request:
+#    branches: [ "master" ]
+
+#env:
+  # Use docker.io for Docker Hub if empty
+#  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+#  IMAGE_NAME: ${{ github.repository }}
+
+
+#jobs:
+#  build:
+
+#    runs-on: ubuntu-latest
+#    permissions:
+#      contents: read
+#      packages: write
       # This is used to complete the identity challenge
       # with sigstore/fulcio when running outside of PRs.
-      id-token: write
+#      id-token: write
 
-    steps:
+#    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
