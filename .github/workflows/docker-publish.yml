@@ -85,6 +85,11 @@ jobs:
 #    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Show branch info
+        run: |
+          echo "Branch: $GITHUB_REF"
+          echo "Commit: $GITHUB_SHA"
+
 
       # Install the cosign tool except on PR
       # https://github.com/sigstore/cosign-installer
