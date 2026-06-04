@@ -1,152 +1,309 @@
-name: Docker
+###############################################################################
+# .github/workflows/terraform.yml
+#
+# OpenTofu – Manual Parameterized Multi-Subscription Deployment Pipeline
+#
+# Flow:
+#   workflow_dispatch → confirm → lint & validate → trivy scan → plan → apply
+#
+# Each environment maps to its own Azure subscription via GitHub Environment
+# scoped secrets. Secrets set at global level are NOT used for credentials —
+# all Azure auth is resolved per-environment inside each job.
+#
+# GitHub Environment setup (Settings → Environments):
+#
+#   Environment: dev
+#     Secrets: AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#              AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#              TF_VAR_COST_CENTER
+#
+#   Environment: test
+#     Secrets: AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#              AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#              TF_VAR_COST_CENTER
+#
+#   Environment: production
+#     Secrets: AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#              AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#              TF_VAR_COST_CENTER
+#     Protection: Required reviewers enabled
+###############################################################################
 
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
+name: OpenTofu-Infrastructure
 
-
-#  schedule:
-#    - cron: '27 12 * * *'
 on:
   workflow_dispatch:
     inputs:
       environment:
         description: "Target environment to deploy"
         required: true
+        default: "dev"
         type: choice
         options:
           - dev
-          - prod
+          - test
+          - production
       confirm:
         description: "Type 'yes' to confirm deployment"
         required: true
         default: "no"
 
+
+# Permissions
+
+permissions:
+  id-token: write        # SPN auth
+  contents: read
+  security-events: write # upload Trivy SARIF (report) to GitHub Security tab
+
+
+# Non-sensitive global defaults only — NO credentials here.
+# Credentials are environment-scoped and injected per job below.
+
 env:
-  TF_VERSION: "1.8.3"        # OpenTofu latest — update as needed
-  WORKING_DIR: "."
+  TF_WORKING_DIR: infra
+  TOFU_VERSION: "1.9.0"
+
+
+# Job 1 – Approval Stage
 
 jobs:
-  # ──────────────────────────────────────────────
-  # RESOLVE: Map environment input → branch + Azure credentials
-  # ──────────────────────────────────────────────
-  resolve:
-    name: Resolve environment
+  confirm:
+    name: Approve Deployment
     runs-on: ubuntu-latest
-    outputs:
-      branch: ${{ steps.map.outputs.branch }}
-      environment: ${{ github.event.inputs.environment }}
-    steps:
-      - name: Validate confirmation
-        if: github.event.inputs.confirm != 'yes'
-        run: |
-          echo "Deployment not confirmed. Type 'yes' in the confirm input."
-          exit 1
 
-      - name: Map environment to branch
-        id: map
+    steps:
+      - name: Check User Input
         run: |
-          ENV="${{ github.event.inputs.environment }}"
-          if [ "$ENV" = "dev" ]; then
-            echo "branch=dev" >> $GITHUB_OUTPUT
-          elif [ "$ENV" = "prod" ]; then
-            echo "branch=master" >> $GITHUB_OUTPUT
-          else
-            echo "Unknown environment: $ENV"
+          if [ "${{ github.event.inputs.confirm }}" != "yes" ]; then
+            echo "::error::Deployment aborted — confirm input must be 'yes'. Got: '${{ github.event.inputs.confirm }}'"
             exit 1
           fi
-#on:
-#  push:
-#    branches: [ "master" ]
-    # Publish semver tags as releases.
-#    tags: [ 'v*.*.*' ]
-#  pull_request:
-#    branches: [ "master" ]
-
-#env:
-  # Use docker.io for Docker Hub if empty
-#  REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
-#  IMAGE_NAME: ${{ github.repository }}
+          echo "Approved. Deploying to: ${{ github.event.inputs.environment }}"
 
 
-#jobs:
-#  build:
+# Job 2 – Lint & Validate
+# No Azure credentials needed — purely static analysis.
 
-#    runs-on: ubuntu-latest
-#    permissions:
-#      contents: read
-#      packages: write
-      # This is used to complete the identity challenge
-      # with sigstore/fulcio when running outside of PRs.
-#      id-token: write
+  lint-and-validate:
+    name: Lint and Validate
+    runs-on: ubuntu-latest
+    needs: confirm
 
-#    steps:
-      - name: Checkout repository
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
-      - name: Show branch info
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: Check Formatting
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          echo "Branch: $GITHUB_REF"
-          echo "Commit: $GITHUB_SHA"
+          tofu fmt -check -recursive
+          if [ $? -ne 0 ]; then
+            echo "::error::Files are not formatted. Run 'tofu fmt -recursive' locally."
+            exit 1
+          fi
+
+      - name: Validate Configuration
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # tofu validate needs init — use -backend=false to skip remote state auth
+        run: |
+          tofu init -backend=false -input=false
+          tofu validate -no-color
 
 
-      # Install the cosign tool except on PR
-      # https://github.com/sigstore/cosign-installer
-      - name: Install cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
+# Job 3 – Trivy IaC Security Scan
+# Ref - https://github.com/aquasecurity/trivy-action/blob/master/README.md
+
+  trivy-scan:
+    name: Trivy IaC Scan
+    runs-on: ubuntu-latest
+    needs: lint-and-validate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy IaC Scan
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
-          cosign-release: 'v2.2.4'
+          scan-type: "config"
+          scan-ref: ${{ env.TF_WORKING_DIR }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
 
-      # Set up BuildKit Docker container builder to be able to build
-      # multi-platform images and export cache
-      # https://github.com/docker/setup-buildx-action
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
-
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
-      - name: Log into registry ${{ env.REGISTRY }}
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+      - name: Upload Trivy SARIF to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          sarif_file: "trivy-results.sarif"
+          category: "trivy-iac"
 
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+      - name: Upload Trivy Results as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          name: trivy-results-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: trivy-results.sarif
+          retention-days: 30
 
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
-      - name: Build and push Docker image
-        id: build-and-push
-        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+
+# Job 4 – Plan
+# Declares the GitHub Environment so environment-scoped secrets are available.
+# This means the correct subscription credentials are used automatically
+# based on which environment was selected in the workflow_dispatch input.
+
+  plan:
+    name: Plan – ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: trivy-scan
+
+    # Declaring environment here unlocks the scoped secrets for this job.
+    # dev   → reads dev secrets   → deploys to dev subscription
+    # test  → reads test secrets  → deploys to test subscription
+    # prod  → reads prod secrets  → deploys to prod subscription
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exit_code }}
+
+    env:
+      # Credentials injected from the selected GitHub Environment's secrets
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      # Terraform variables
+      TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+      TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+      TF_VAR_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      TF_VAR_environment: ${{ github.event.inputs.environment }}
+      TF_VAR_cost_center: ${{ secrets.TF_VAR_COST_CENTER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
         with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tofu_version: ${{ env.TOFU_VERSION }}
 
-      # Sign the resulting Docker image digest except on PRs.
-      # This will only write to the public Rekor transparency log when the Docker
-      # repository is public to avoid leaking data.  If you would like to publish
-      # transparency data even for private images, pass --force to cosign below.
-      # https://github.com/sigstore/cosign
-      - name: Sign the published Docker image
-        if: ${{ github.event_name != 'pull_request' }}
-        env:
-          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-          TAGS: ${{ steps.meta.outputs.tags }}
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        # This step uses the identity token to provision an ephemeral certificate
-        # against the sigstore community Fulcio instance.
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+      - name: OpenTofu Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: tofu init -input=false
+
+      - name: OpenTofu Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set +e
+          tofu plan \
+            -input=false \
+            -no-color \
+            -detailed-exitcode \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -out=tfplan \
+            2>&1 | tee plan_output.txt
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/plan_output.txt
+          retention-days: 5
+
+      - name: Print Plan Summary
+        run: |
+          echo "### OpenTofu Plan – ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Subscription | ${{ secrets.AZURE_SUBSCRIPTION_ID }} |" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -20 ${{ env.TF_WORKING_DIR }}/plan_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail on Plan Error
+        if: steps.plan.outputs.exit_code == '1'
+        run: |
+          echo "::error::tofu plan failed."
+          exit 1
+
+
+# Job 5 – Apply
+# Also declares the same GitHub Environment — same scoped secrets apply.
+# For production, the environment's required reviewers gate kicks in here,
+# pausing the job until an approved reviewer clicks Approve in GitHub UI.
+
+  apply:
+    name: Apply – ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: plan
+    if: needs.plan.outputs.plan_exit_code == '2'
+
+    environment:
+      name: ${{ github.event.inputs.environment }}
+      url: https://portal.azure.com
+
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+      TF_VAR_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+      TF_VAR_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      TF_VAR_environment: ${{ github.event.inputs.environment }}
+      TF_VAR_cost_center: ${{ secrets.TF_VAR_COST_CENTER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: OpenTofu Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: tofu init -input=false
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: OpenTofu Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          tofu apply \
+            -input=false \
+            -no-color \
+            tfplan
+
+      - name: Post Apply Summary
+        if: always()
+        run: |
+          echo "### OpenTofu Apply – ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Subscription | ${{ secrets.AZURE_SUBSCRIPTION_ID }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run ID | ${{ github.run_id }} |" >> $GITHUB_STEP_SUMMARY
